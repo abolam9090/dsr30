@@ -223,6 +223,33 @@ static void Apply(bool toThirty) {
 }
 
 
+
+// ---- narrow candidates by checking their CURRENT value (for games with a 30fps mode and a 60fps mode) ----
+static double gAltRatio = 2.0;   // value seen in the 30 fps mode = ScanValue * AltRatio
+
+static void Filter(bool wantAlt) {
+    double td = wantAlt ? gScanValueD * gAltRatio : gScanValueD;
+    float tf = (float)td; UINT32 tfb; memcpy(&tfb, &tf, 4); UINT64 tdb; memcpy(&tdb, &td, 8);
+    BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+    std::vector<Cand> kept;
+    for (auto& c : gCands) {
+        UINT64 buf = 0; SIZE_T got = 0;
+        SIZE_T need = c.isDouble ? 8 : 4;
+        if (!ReadProcessMemory(GetCurrentProcess(), c.addr, &buf, need, &got) || got != need) continue;
+        bool ok = c.isDouble ? (buf == tdb) : ((UINT32)buf == tfb);
+        if (ok) kept.push_back(c);
+    }
+    gCands = kept; gPatched = false;
+    Log("Filter (%s value %.9g): %u candidates left", wantAlt ? "30fps-mode" : "60fps-mode", td, (unsigned)gCands.size());
+    for (size_t i = 0; i < gCands.size() && i < 100; i++) {
+        BYTE* a = gCands[i].addr;
+        if (a >= exe && a < exe + 0x10000000)
+            Log("  %s at exe+0x%llX", gCands[i].isDouble ? "double" : "float", (unsigned long long)(a - exe));
+        else
+            Log("  %s at 0x%p", gCands[i].isDouble ? "double" : "float", a);
+    }
+}
+
 // ---- patch only specific exe offsets (from dsr30.ini "Patch=") ----
 static std::vector<size_t> gOffsets;
 
@@ -270,7 +297,7 @@ static DWORD WINAPI AutoPatchThread(LPVOID p) {
 }
 
 static DWORD WINAPI HotkeyThread(LPVOID) {
-    bool k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
+    bool k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false, k3 = false, k4 = false;
     for (;;) {
         Sleep(50);
         bool n6 = GetAsyncKeyState(VK_F6) & 0x8000, n7 = GetAsyncKeyState(VK_F7) & 0x8000;
@@ -282,7 +309,10 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         bool n10 = GetAsyncKeyState(VK_F10) & 0x8000, n11 = GetAsyncKeyState(VK_F11) & 0x8000;
         if (n10 && !k10) { gDtScale -= 0.02f; if (gPatched && (!gOffsets.empty() || !gOffsets2.empty())) ApplyList(true); else Log("dtScale=%.3f", gDtScale); }
         if (n11 && !k11) { gDtScale += 0.02f; if (gPatched && (!gOffsets.empty() || !gOffsets2.empty())) ApplyList(true); else Log("dtScale=%.3f", gDtScale); }
-        k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
+        bool n3 = GetAsyncKeyState(VK_F3) & 0x8000, n4 = GetAsyncKeyState(VK_F4) & 0x8000;
+        if (n3 && !k3) Filter(true);    // call while in the 30 fps section
+        if (n4 && !k4) Filter(false);   // call while in the 60 fps section
+        k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11; k3 = n3; k4 = n4;
     }
 }
 
@@ -295,6 +325,7 @@ static DWORD WINAPI Init(LPVOID) {
     { char* sl = strchr(b, '/');           // allows exact values like 1/60 or 1000/60
       double v = sl ? atof(b) / atof(sl + 1) : atof(b);
       SetScan(v); }
+    GetPrivateProfileStringA("dsr30", "AltRatio", "2.0", b, 64, ini); gAltRatio = atof(b);
     gCurBits = gCurBits2 = gScanF;
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
@@ -318,7 +349,7 @@ static DWORD WINAPI Init(LPVOID) {
     int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 15, ini);
     if (autoSec > 0 && (!gOffsets.empty() || !gOffsets2.empty())) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
     CreateThread(0, 0, HotkeyThread, 0, 0, 0);
-    Log("Hotkeys: F6 scan exe, F7 scan all, F8 patch, F9 restore, F10 dt -2%%, F11 dt +2%%");
+    Log("Hotkeys: F6 scan exe, F7 scan all, F8 patch, F9 restore, F10 dt -2%%, F11 dt +2%%, F3 filter(30fps section), F4 filter(60fps section)");
     if (GetPrivateProfileIntA("dsr30", "Vsync30", 1, ini)) {
         DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
         int hz = EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) ? (int)dm.dmDisplayFrequency : 0;
