@@ -298,9 +298,9 @@ static DWORD WINAPI Init(LPVOID) {
     GetPrivateProfileStringA("dsr30", "Patch", "12CCC78", lst, 2048, ini);
     for (char* t = strtok(lst, ", "); t; t = strtok(nullptr, ", ")) gOffsets.push_back((size_t)strtoull(t, nullptr, 16));
     GetPrivateProfileStringA("dsr30", "DtScale2", "2.0", b, 64, ini); gDtScale2 = (float)atof(b);
-    char lst2[2048];
-    GetPrivateProfileStringA("dsr30", "Patch2", "1342C10,1342C14,1342C18,1342C1C", lst2, 2048, ini);
-    for (char* t = strtok(lst2, ", "); t; t = strtok(nullptr, ", ")) gOffsets2.push_back((size_t)strtoull(t, nullptr, 16));
+    char patch2str[2048];
+    GetPrivateProfileStringA("dsr30", "Patch2", "1342C10,1342C14,1342C18,1342C1C", patch2str, 2048, ini);
+    for (char* t = strtok(patch2str, ", "); t; t = strtok(nullptr, ", ")) gOffsets2.push_back((size_t)strtoull(t, nullptr, 16));
     Log("Speed spots: %u (scale %.3f), camera spots: %u (scale %.3f)", (unsigned)gOffsets.size(), gDtScale, (unsigned)gOffsets2.size(), gDtScale2);
     int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 15, ini);
     if (autoSec > 0) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
