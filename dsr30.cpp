@@ -1,6 +1,7 @@
 // dsr30.cpp - EXPERIMENTAL 30 FPS cap + 2x time scale for Dark Souls Remastered.
 // dinput8.dll proxy. No third-party libraries. OFFLINE USE ONLY.
 #include <windows.h>
+#include <mmsystem.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <string.h>
@@ -273,6 +274,7 @@ static DWORD WINAPI Init(LPVOID) {
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
     Log("---- loaded. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
+    timeBeginPeriod(1);   // precise Sleep() so the limiter does not overshoot frames
     Sleep(2000);
     if (TIME_SCALE != 1.0) {
         Log("IAT QueryPerformanceCounter: %d", HookIAT("QueryPerformanceCounter", (void*)hQPC, (void**)&oQPC));
