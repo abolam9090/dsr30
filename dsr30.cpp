@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <vector>
+#include <stdint.h>
 
 static double TIME_SCALE = 1.0;
 static double TARGET_FPS = 30.0;
@@ -202,6 +203,38 @@ static void Apply(bool toThirty) {
     Log("%s %d locations", toThirty ? "PATCHED to 1/30:" : "RESTORED to 1/60:", n);
 }
 
+
+// ---- patch only specific exe offsets (from dsr30.ini "Patch=") ----
+static std::vector<size_t> gOffsets;
+
+static void ApplyList(bool toThirty) {
+    BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+    int n = 0;
+    for (size_t off : gOffsets) {
+        BYTE* a = exe + off;
+        UINT32 cur; memcpy(&cur, a, 4);
+        UINT32 want = toThirty ? F30 : F60, expect = toThirty ? F60 : F30;
+        if (cur != expect && cur != want) { Log("  skip exe+0x%llX (value changed)", (unsigned long long)off); continue; }
+        DWORD old;
+        if (!VirtualProtect(a, 4, PAGE_EXECUTE_READWRITE, &old)) continue;
+        memcpy(a, &want, 4);
+        VirtualProtect(a, 4, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), a, 4);
+        n++;
+    }
+    Log("%s %d listed locations", toThirty ? "PATCHED (list) to 1/30:" : "RESTORED (list) to 1/60:", n);
+}
+
+static void DoPatch(bool toThirty) {
+    if (!gOffsets.empty()) ApplyList(toThirty); else Apply(toThirty);
+}
+
+static DWORD WINAPI AutoPatchThread(LPVOID p) {
+    Sleep((DWORD)(INT_PTR)p * 1000);
+    DoPatch(true);
+    return 0;
+}
+
 static DWORD WINAPI HotkeyThread(LPVOID) {
     bool k6 = false, k7 = false, k8 = false, k9 = false;
     for (;;) {
@@ -210,8 +243,8 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         bool n8 = GetAsyncKeyState(VK_F8) & 0x8000, n9 = GetAsyncKeyState(VK_F9) & 0x8000;
         if (n6 && !k6) Scan(false);
         if (n7 && !k7) Scan(true);
-        if (n8 && !k8) Apply(true);
-        if (n9 && !k9) Apply(false);
+        if (n8 && !k8) DoPatch(true);
+        if (n9 && !k9) DoPatch(false);
         k6 = n6; k7 = n7; k8 = n8; k9 = n9;
     }
 }
@@ -230,6 +263,12 @@ static DWORD WINAPI Init(LPVOID) {
         Log("IAT GetTickCount64: %d", HookIAT("GetTickCount64", (void*)hGTC64, (void**)&oGTC64));
         Log("IAT timeGetTime: %d", HookIAT("timeGetTime", (void*)hTGT, (void**)&oTGT));
     }
+    char lst[2048];
+    GetPrivateProfileStringA("dsr30", "Patch", "", lst, 2048, ini);
+    for (char* t = strtok(lst, ", "); t; t = strtok(nullptr, ", ")) gOffsets.push_back((size_t)strtoull(t, nullptr, 16));
+    Log("Patch list has %u offsets", (unsigned)gOffsets.size());
+    int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 0, ini);
+    if (autoSec > 0) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
     CreateThread(0, 0, HotkeyThread, 0, 0, 0);
     Log("Hotkeys: F6 scan exe, F7 scan whole process, F8 patch to 1/30, F9 restore");
     HookPresentVtable();
