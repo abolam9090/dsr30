@@ -291,8 +291,10 @@ static DWORD WINAPI Init(LPVOID) {
     char* sl = strrchr(gDir, '\\'); if (sl) sl[1] = 0;
     char ini[MAX_PATH]; lstrcpyA(ini, gDir); lstrcatA(ini, "dsr30.ini");
     char b[64];
-    GetPrivateProfileStringA("dsr30", "ScanValue", "0.016666667", b, 64, ini);
-    SetScan(atof(b));
+    GetPrivateProfileStringA("dsr30", "ScanValue", "1/60", b, 64, ini);
+    { char* sl = strchr(b, '/');           // allows exact values like 1/60 or 1000/60
+      double v = sl ? atof(b) / atof(sl + 1) : atof(b);
+      SetScan(v); }
     gCurBits = gCurBits2 = gScanF;
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
