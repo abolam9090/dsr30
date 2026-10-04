@@ -147,6 +147,10 @@ static void HookPresentVtable() {
 // ---- timestep scanner / patcher ----
 static float gDtScale = 2.0f;      // multiplier for Patch= spots (2.0 turns 1/60 into 1/30)
 static float gDtScale2 = 2.0f;     // multiplier for Patch2= spots
+static CRITICAL_SECTION gCS;
+struct Lock { Lock() { EnterCriticalSection(&gCS); } ~Lock() { LeaveCriticalSection(&gCS); } };
+static volatile bool gFreezeOn = false;     // keep re-writing patched values (ini: Freeze=1)
+static bool gFreezeEnabled = true;
 struct Cand { BYTE* addr; bool isDouble; };
 static std::vector<Cand> gCands;
 static bool gPatched = false;
@@ -168,6 +172,7 @@ static bool Readable(const MEMORY_BASIC_INFORMATION& m) {
 }
 
 static void Scan(bool wholeProcess) {
+    Lock lk;
     Log("Scan started (%s)...", wholeProcess ? "whole process" : "exe only");
     gCands.clear(); gPatched = false;
     BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
@@ -216,6 +221,7 @@ static void Scan(bool wholeProcess) {
 }
 
 static void Apply(bool toThirty) {
+    Lock lk;
     int n = 0;
     for (auto& c : gCands) {
         DWORD old;
@@ -228,6 +234,7 @@ static void Apply(bool toThirty) {
         n++;
     }
     gPatched = toThirty;
+    gFreezeOn = toThirty && gFreezeEnabled;
     Log("%s %d locations", toThirty ? "PATCHED to 1/30:" : "RESTORED to 1/60:", n);
 }
 
@@ -237,6 +244,7 @@ static void Apply(bool toThirty) {
 static double gAltRatio = 2.0;   // value seen in the 30 fps mode = ScanValue * AltRatio
 
 static void Filter(bool wantAlt) {
+    Lock lk;
     Log("Filter started (%s)...", wantAlt ? "30fps-mode" : "60fps-mode");
     double td = wantAlt ? gScanValueD * gAltRatio : gScanValueD;
     float tf = (float)td; UINT32 tfb; memcpy(&tfb, &tf, 4); UINT64 tdb; memcpy(&tdb, &td, 8);
@@ -306,6 +314,37 @@ static DWORD WINAPI AutoPatchThread(LPVOID p) {
     return 0;
 }
 
+
+// ---- re-write patched values continuously and report if the game keeps reverting them ----
+static DWORD WINAPI FreezeThread(LPVOID) {
+    ULONGLONG last = GetTickCount64(); unsigned long long reverted = 0, checks = 0;
+    for (;;) {
+        Sleep(1);
+        if (!gFreezeOn) { last = GetTickCount64(); reverted = 0; checks = 0; continue; }
+        {
+            Lock lk;
+            double nd = gScanValueD * gDtScale; float nf = (float)nd;
+            UINT32 nfb; memcpy(&nfb, &nf, 4); UINT64 ndb; memcpy(&ndb, &nd, 8);
+            for (auto& c : gCands) {
+                UINT64 cur = 0; SIZE_T got = 0, need = c.isDouble ? 8 : 4;
+                if (!ReadProcessMemory(GetCurrentProcess(), c.addr, &cur, need, &got) || got != need) continue;
+                checks++;
+                bool same = c.isDouble ? (cur == ndb) : ((UINT32)cur == nfb);
+                if (!same) {
+                    reverted++;
+                    SIZE_T wr = 0;
+                    if (c.isDouble) WriteProcessMemory(GetCurrentProcess(), c.addr, &ndb, 8, &wr);
+                    else WriteProcessMemory(GetCurrentProcess(), c.addr, &nfb, 4, &wr);
+                }
+            }
+        }
+        if (GetTickCount64() - last > 5000) {
+            Log("freeze: %llu of %llu checks found the game had reverted the value (last 5s)", reverted, checks);
+            last = GetTickCount64(); reverted = 0; checks = 0;
+        }
+    }
+}
+
 static DWORD WINAPI HotkeyThread(LPVOID) {
     bool k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false, k3 = false, k4 = false;
     for (;;) {
@@ -327,6 +366,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
 }
 
 static DWORD WINAPI Init(LPVOID) {
+    InitializeCriticalSection(&gCS);
     GetModuleFileNameA(nullptr, gDir, MAX_PATH);
     char* sl = strrchr(gDir, '\\'); if (sl) sl[1] = 0;
     char ini[MAX_PATH]; lstrcpyA(ini, gDir); lstrcatA(ini, "dsr30.ini");
@@ -339,7 +379,7 @@ static DWORD WINAPI Init(LPVOID) {
     gCurBits = gCurBits2 = gScanF;
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
-    Log("---- loaded (generic build v4 safe-scan). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
+    Log("---- loaded (generic build v5 freeze). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
     timeBeginPeriod(1);   // precise Sleep() so the limiter does not overshoot frames
     Sleep(2000);
     if (TIME_SCALE != 1.0) {
@@ -358,6 +398,8 @@ static DWORD WINAPI Init(LPVOID) {
     Log("Speed spots: %u (scale %.3f), camera spots: %u (scale %.3f)", (unsigned)gOffsets.size(), gDtScale, (unsigned)gOffsets2.size(), gDtScale2);
     int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 15, ini);
     if (autoSec > 0 && (!gOffsets.empty() || !gOffsets2.empty())) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
+    gFreezeEnabled = GetPrivateProfileIntA("dsr30", "Freeze", 1, ini) != 0;
+    CreateThread(0, 0, FreezeThread, 0, 0, 0);
     CreateThread(0, 0, HotkeyThread, 0, 0, 0);
     Log("Hotkeys: F6 scan exe, F7 scan all, F8 patch, F9 restore, F10 dt -2%%, F11 dt +2%%, F3 filter(30fps section), F4 filter(60fps section)");
     if (GetPrivateProfileIntA("dsr30", "Vsync30", 1, ini)) {
