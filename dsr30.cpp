@@ -7,8 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <vector>
 
-static double TIME_SCALE = 2.0;
+static double TIME_SCALE = 1.0;
 static double TARGET_FPS = 30.0;
 static char gDir[MAX_PATH];
 
@@ -132,19 +133,105 @@ static void HookPresentVtable() {
     DestroyWindow(w);
 }
 
+
+// ---- timestep scanner / patcher (1/60 -> 1/30) ----
+struct Cand { BYTE* addr; bool isDouble; };
+static std::vector<Cand> gCands;
+static bool gPatched = false;
+static const UINT32 F60 = 0x3C888889u, F30 = 0x3D088889u;
+static const UINT64 D60 = 0x3F91111111111111ull, D30 = 0x3FA1111111111111ull;
+
+static bool Readable(const MEMORY_BASIC_INFORMATION& m) {
+    if (m.State != MEM_COMMIT) return false;
+    if (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return (m.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+static void Scan(bool wholeProcess) {
+    gCands.clear(); gPatched = false;
+    BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+    auto nt = (IMAGE_NT_HEADERS*)(exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    SIZE_T exeSize = nt->OptionalHeader.SizeOfImage;
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCSTR)&Scan, &self);
+    BYTE* sb = (BYTE*)self;
+    SIZE_T ss = ((IMAGE_NT_HEADERS*)(sb + ((IMAGE_DOS_HEADER*)sb)->e_lfanew))->OptionalHeader.SizeOfImage;
+
+    BYTE* p = wholeProcess ? (BYTE*)0x10000 : exe;
+    BYTE* end = wholeProcess ? (BYTE*)0x7FFFFFFE0000ull : exe + exeSize;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION m;
+        if (!VirtualQuery(p, &m, sizeof(m))) break;
+        BYTE* rb = (BYTE*)m.BaseAddress; SIZE_T rs = m.RegionSize;
+        bool isSelf = rb < sb + ss && rb + rs > sb;
+        if (Readable(m) && !isSelf) {
+            size_t step = wholeProcess ? 4 : 1;
+            for (SIZE_T i = 0; i + 8 <= rs; i += step) {
+                UINT32 f; memcpy(&f, rb + i, 4);
+                if (f == F60) { gCands.push_back({ rb + i, false }); continue; }
+                UINT64 d; memcpy(&d, rb + i, 8);
+                if (d == D60) gCands.push_back({ rb + i, true });
+            }
+        }
+        p = rb + rs;
+    }
+    Log("Scan (%s): %u candidates", wholeProcess ? "whole process" : "exe only", (unsigned)gCands.size());
+    for (size_t i = 0; i < gCands.size() && i < 60; i++) {
+        BYTE* a = gCands[i].addr;
+        if (a >= exe && a < exe + exeSize)
+            Log("  %s at exe+0x%llX", gCands[i].isDouble ? "double" : "float", (unsigned long long)(a - exe));
+        else
+            Log("  %s at 0x%p (outside exe)", gCands[i].isDouble ? "double" : "float", a);
+    }
+}
+
+static void Apply(bool toThirty) {
+    int n = 0;
+    for (auto& c : gCands) {
+        DWORD old;
+        if (!VirtualProtect(c.addr, 8, PAGE_EXECUTE_READWRITE, &old)) continue;
+        if (c.isDouble) { UINT64 v = toThirty ? D30 : D60; memcpy(c.addr, &v, 8); }
+        else { UINT32 v = toThirty ? F30 : F60; memcpy(c.addr, &v, 4); }
+        VirtualProtect(c.addr, 8, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), c.addr, 8);
+        n++;
+    }
+    gPatched = toThirty;
+    Log("%s %d locations", toThirty ? "PATCHED to 1/30:" : "RESTORED to 1/60:", n);
+}
+
+static DWORD WINAPI HotkeyThread(LPVOID) {
+    bool k6 = false, k7 = false, k8 = false, k9 = false;
+    for (;;) {
+        Sleep(50);
+        bool n6 = GetAsyncKeyState(VK_F6) & 0x8000, n7 = GetAsyncKeyState(VK_F7) & 0x8000;
+        bool n8 = GetAsyncKeyState(VK_F8) & 0x8000, n9 = GetAsyncKeyState(VK_F9) & 0x8000;
+        if (n6 && !k6) Scan(false);
+        if (n7 && !k7) Scan(true);
+        if (n8 && !k8) Apply(true);
+        if (n9 && !k9) Apply(false);
+        k6 = n6; k7 = n7; k8 = n8; k9 = n9;
+    }
+}
+
 static DWORD WINAPI Init(LPVOID) {
     GetModuleFileNameA(nullptr, gDir, MAX_PATH);
     char* sl = strrchr(gDir, '\\'); if (sl) sl[1] = 0;
     char ini[MAX_PATH]; lstrcpyA(ini, gDir); lstrcatA(ini, "dsr30.ini");
     char b[64];
-    GetPrivateProfileStringA("dsr30", "TimeScale", "2.0", b, 64, ini); TIME_SCALE = atof(b);
+    GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
     Log("---- loaded. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
     Sleep(2000);
-    Log("IAT QueryPerformanceCounter: %d", HookIAT("QueryPerformanceCounter", (void*)hQPC, (void**)&oQPC));
-    Log("IAT GetTickCount64: %d", HookIAT("GetTickCount64", (void*)hGTC64, (void**)&oGTC64));
-    Log("IAT timeGetTime: %d", HookIAT("timeGetTime", (void*)hTGT, (void**)&oTGT));
-    Log("IAT GetTickCount: %d (not hooked, info only)", 0);
+    if (TIME_SCALE != 1.0) {
+        Log("IAT QueryPerformanceCounter: %d", HookIAT("QueryPerformanceCounter", (void*)hQPC, (void**)&oQPC));
+        Log("IAT GetTickCount64: %d", HookIAT("GetTickCount64", (void*)hGTC64, (void**)&oGTC64));
+        Log("IAT timeGetTime: %d", HookIAT("timeGetTime", (void*)hTGT, (void**)&oTGT));
+    }
+    CreateThread(0, 0, HotkeyThread, 0, 0, 0);
+    Log("Hotkeys: F6 scan exe, F7 scan whole process, F8 patch to 1/30, F9 restore");
     HookPresentVtable();
     Log("Present vtable hooked: %d", oPresent != nullptr);
     return 0;
