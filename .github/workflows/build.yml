@@ -1,0 +1,29 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - run: cl /LD /O2 /EHsc dsr30.cpp /link /OUT:dinput8.dll d3d11.lib dxgi.lib winmm.lib user32.lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dinput8
+          path: dinput8.dllname: build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - run: cl /LD /O2 /EHsc dsr30.cpp /link /OUT:dinput8.dll d3d11.lib dxgi.lib winmm.lib user32.lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dinput8
+          path: dinput8.dll
