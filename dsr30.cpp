@@ -94,6 +94,11 @@ static LONGLONG nextFrame = 0;
 
 static HRESULT STDMETHODCALLTYPE hPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
     static int n = 0; if (++n == 1) Log("Present hook is running");
+    static LONGLONG t0 = 0; static int frames = 0;
+    { LARGE_INTEGER q, qf; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&qf);
+      if (!t0) t0 = q.QuadPart; frames++;
+      double el = (double)(q.QuadPart - t0) / qf.QuadPart;
+      if (el >= 10.0) { Log("measured FPS: %.2f", frames / el); t0 = q.QuadPart; frames = 0; } }
     HRESULT hr = oPresent(sc, sync, flags);
     LARGE_INTEGER f, now;
     QueryPerformanceFrequency(&f);
@@ -207,14 +212,18 @@ static void Apply(bool toThirty) {
 // ---- patch only specific exe offsets (from dsr30.ini "Patch=") ----
 static std::vector<size_t> gOffsets;
 
+static float gDtScale = 2.0f;      // 2.0 = exactly 1/30
+static UINT32 gCurBits = F60;      // value we last wrote
+
 static void ApplyList(bool toThirty) {
     BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+    float fv = gDtScale / 60.0f; UINT32 want; memcpy(&want, &fv, 4);
+    if (!toThirty) want = F60;
     int n = 0;
     for (size_t off : gOffsets) {
         BYTE* a = exe + off;
         UINT32 cur; memcpy(&cur, a, 4);
-        UINT32 want = toThirty ? F30 : F60, expect = toThirty ? F60 : F30;
-        if (cur != expect && cur != want) { Log("  skip exe+0x%llX (value changed)", (unsigned long long)off); continue; }
+        if (cur != F60 && cur != gCurBits && cur != want) { Log("  skip exe+0x%llX (value changed)", (unsigned long long)off); continue; }
         DWORD old;
         if (!VirtualProtect(a, 4, PAGE_EXECUTE_READWRITE, &old)) continue;
         memcpy(a, &want, 4);
@@ -222,7 +231,8 @@ static void ApplyList(bool toThirty) {
         FlushInstructionCache(GetCurrentProcess(), a, 4);
         n++;
     }
-    Log("%s %d listed locations", toThirty ? "PATCHED (list) to 1/30:" : "RESTORED (list) to 1/60:", n);
+    gCurBits = want; gPatched = toThirty;
+    Log("%s dtScale=%.3f (%.6f s) at %d locations", toThirty ? "PATCHED" : "RESTORED", toThirty ? gDtScale : 1.0f, toThirty ? fv : 1.0f/60.0f, n);
 }
 
 static void DoPatch(bool toThirty) {
@@ -236,7 +246,7 @@ static DWORD WINAPI AutoPatchThread(LPVOID p) {
 }
 
 static DWORD WINAPI HotkeyThread(LPVOID) {
-    bool k6 = false, k7 = false, k8 = false, k9 = false;
+    bool k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
     for (;;) {
         Sleep(50);
         bool n6 = GetAsyncKeyState(VK_F6) & 0x8000, n7 = GetAsyncKeyState(VK_F7) & 0x8000;
@@ -245,7 +255,10 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         if (n7 && !k7) Scan(true);
         if (n8 && !k8) DoPatch(true);
         if (n9 && !k9) DoPatch(false);
-        k6 = n6; k7 = n7; k8 = n8; k9 = n9;
+        bool n10 = GetAsyncKeyState(VK_F10) & 0x8000, n11 = GetAsyncKeyState(VK_F11) & 0x8000;
+        if (n10 && !k10) { gDtScale -= 0.02f; if (gPatched && !gOffsets.empty()) ApplyList(true); else Log("dtScale=%.3f", gDtScale); }
+        if (n11 && !k11) { gDtScale += 0.02f; if (gPatched && !gOffsets.empty()) ApplyList(true); else Log("dtScale=%.3f", gDtScale); }
+        k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
     }
 }
 
@@ -263,6 +276,7 @@ static DWORD WINAPI Init(LPVOID) {
         Log("IAT GetTickCount64: %d", HookIAT("GetTickCount64", (void*)hGTC64, (void**)&oGTC64));
         Log("IAT timeGetTime: %d", HookIAT("timeGetTime", (void*)hTGT, (void**)&oTGT));
     }
+    GetPrivateProfileStringA("dsr30", "DtScale", "2.0", b, 64, ini); gDtScale = (float)atof(b);
     char lst[2048];
     GetPrivateProfileStringA("dsr30", "Patch", "", lst, 2048, ini);
     for (char* t = strtok(lst, ", "); t; t = strtok(nullptr, ", ")) gOffsets.push_back((size_t)strtoull(t, nullptr, 16));
@@ -270,7 +284,7 @@ static DWORD WINAPI Init(LPVOID) {
     int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 0, ini);
     if (autoSec > 0) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
     CreateThread(0, 0, HotkeyThread, 0, 0, 0);
-    Log("Hotkeys: F6 scan exe, F7 scan whole process, F8 patch to 1/30, F9 restore");
+    Log("Hotkeys: F6 scan exe, F7 scan all, F8 patch, F9 restore, F10 dt -2%%, F11 dt +2%%");
     HookPresentVtable();
     Log("Present vtable hooked: %d", oPresent != nullptr);
     return 0;
