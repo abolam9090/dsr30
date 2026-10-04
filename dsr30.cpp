@@ -306,7 +306,45 @@ static void ApplyList(bool toThirty) {
         toThirty ? "PATCHED" : "RESTORED", toThirty ? gDtScale : 1.0f, n1, toThirty ? gDtScale2 : 1.0f, n2);
 }
 
+
+// ---- direct pokes into the exe (ini: Poke=OFFSET=TYPEvalue,... e.g. 25E82D8=i30,25E82F8=f30 ; Peek=OFFSET:TYPE,...) ----
+struct Poke { size_t off; char type; double val; BYTE orig[8]; bool haveOrig; };
+static std::vector<Poke> gPokes;
+static std::vector<std::pair<size_t, char>> gPeeks;
+static bool gPokesOn = false;
+
+static size_t PokeLen(char t) { return t == 'd' ? 8 : 4; }
+static void PokeBytes(const Poke& p, BYTE* out) {
+    if (p.type == 'f') { float f = (float)p.val; memcpy(out, &f, 4); }
+    else if (p.type == 'i') { int v = (int)p.val; memcpy(out, &v, 4); }
+    else { double d = p.val; memcpy(out, &d, 8); }
+}
+static void LogValue(size_t off, char type, const char* tag) {
+    BYTE* a = (BYTE*)GetModuleHandleA(nullptr) + off; BYTE b[8] = {}; SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), a, b, PokeLen(type), &got) || got != PokeLen(type)) { Log("%s exe+0x%llX unreadable", tag, (unsigned long long)off); return; }
+    if (type == 'f') { float f; memcpy(&f, b, 4); Log("%s exe+0x%llX = %.9g (float)", tag, (unsigned long long)off, f); }
+    else if (type == 'i') { int v; memcpy(&v, b, 4); Log("%s exe+0x%llX = %d (int)", tag, (unsigned long long)off, v); }
+    else { double d; memcpy(&d, b, 8); Log("%s exe+0x%llX = %.12g (double)", tag, (unsigned long long)off, d); }
+}
+static void ApplyPokes(bool on) {
+    Lock lk;
+    BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+    for (auto& p : gPokes) {
+        BYTE* a = exe + p.off; SIZE_T n = PokeLen(p.type), w = 0, got = 0;
+        if (!p.haveOrig) { if (ReadProcessMemory(GetCurrentProcess(), a, p.orig, n, &got) && got == n) p.haveOrig = true; }
+        LogValue(p.off, p.type, on ? "before poke:" : "before restore:");
+        BYTE nb[8]; if (on) PokeBytes(p, nb); else if (p.haveOrig) memcpy(nb, p.orig, 8); else continue;
+        DWORD old; VirtualProtect(a, n, PAGE_EXECUTE_READWRITE, &old);
+        WriteProcessMemory(GetCurrentProcess(), a, nb, n, &w);
+        VirtualProtect(a, n, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), a, n);
+    }
+    gPokesOn = on;
+    Log("%s %u pokes", on ? "POKES APPLIED:" : "POKES RESTORED:", (unsigned)gPokes.size());
+}
+
 static void DoPatch(bool toThirty) {
+    if (!gPokes.empty()) { ApplyPokes(toThirty); return; }
     if (!gOffsets.empty() || !gOffsets2.empty()) ApplyList(toThirty); else Apply(toThirty);
 }
 
@@ -392,6 +430,24 @@ static DWORD WINAPI FreezeThread(LPVOID) {
     for (;;) {
         Sleep(1);
         if (gArmed) LogNewHits();
+        {   // keep pokes in place and report values
+            static ULONGLONG lastPeek = 0; static unsigned pokeReverts = 0;
+            if (gPokesOn && gFreezeEnabled) {
+                Lock lk;
+                BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+                for (auto& p : gPokes) {
+                    BYTE want[8], cur[8] = {}; SIZE_T n = PokeLen(p.type), got = 0, w = 0;
+                    PokeBytes(p, want);
+                    if (!ReadProcessMemory(GetCurrentProcess(), exe + p.off, cur, n, &got) || got != n) continue;
+                    if (memcmp(cur, want, n) != 0) { pokeReverts++; WriteProcessMemory(GetCurrentProcess(), exe + p.off, want, n, &w); }
+                }
+            }
+            if ((!gPeeks.empty() || gPokesOn) && GetTickCount64() - lastPeek > 5000) {
+                lastPeek = GetTickCount64();
+                for (auto& pk : gPeeks) LogValue(pk.first, pk.second, "peek:");
+                if (gPokesOn) { Log("pokes: game reverted a poked value %u times in the last 5s", pokeReverts); pokeReverts = 0; }
+            }
+        }
         if (!gFreezeOn) { last = GetTickCount64(); cnt.clear(); checks = 0; continue; }
         {
             Lock lk;
@@ -464,7 +520,7 @@ static DWORD WINAPI Init(LPVOID) {
     gCurBits = gCurBits2 = gScanF;
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
-    Log("---- loaded (generic build v6 watch). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
+    Log("---- loaded (generic build v7 poke). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
     timeBeginPeriod(1);   // precise Sleep() so the limiter does not overshoot frames
     Sleep(2000);
     if (TIME_SCALE != 1.0) {
@@ -481,9 +537,21 @@ static DWORD WINAPI Init(LPVOID) {
     GetPrivateProfileStringA("dsr30", "Patch2", "", patch2str, 2048, ini);
     for (char* t = strtok(patch2str, ", "); t; t = strtok(nullptr, ", ")) gOffsets2.push_back((size_t)strtoull(t, nullptr, 16));
     Log("Speed spots: %u (scale %.3f), camera spots: %u (scale %.3f)", (unsigned)gOffsets.size(), gDtScale, (unsigned)gOffsets2.size(), gDtScale2);
-    int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 15, ini);
-    if (autoSec > 0 && (!gOffsets.empty() || !gOffsets2.empty())) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
     gFreezeEnabled = GetPrivateProfileIntA("dsr30", "Freeze", 1, ini) != 0;
+    { char pk[1024]; GetPrivateProfileStringA("dsr30", "Poke", "", pk, 1024, ini);
+      for (char* t = strtok(pk, ", "); t; t = strtok(nullptr, ", ")) {
+          char* eq = strchr(t, '='); if (!eq || !eq[1]) continue;
+          Poke p = {}; p.off = (size_t)strtoull(t, nullptr, 16); p.type = eq[1]; p.val = atof(eq + 2);
+          if (p.type == 'f' || p.type == 'i' || p.type == 'd') gPokes.push_back(p);
+      }
+      char pe[1024]; GetPrivateProfileStringA("dsr30", "Peek", "", pe, 1024, ini);
+      for (char* t = strtok(pe, ", "); t; t = strtok(nullptr, ", ")) {
+          char* c = strchr(t, ':'); if (!c || !c[1]) continue;
+          gPeeks.push_back({ (size_t)strtoull(t, nullptr, 16), c[1] });
+      }
+      Log("Pokes: %u, peeks: %u", (unsigned)gPokes.size(), (unsigned)gPeeks.size()); }
+    int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 15, ini);
+    if (autoSec > 0 && (!gOffsets.empty() || !gOffsets2.empty() || !gPokes.empty())) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
     CreateThread(0, 0, FreezeThread, 0, 0, 0);
     CreateThread(0, 0, HotkeyThread, 0, 0, 0);
     Log("Hotkeys: F6 scan exe, F7 scan all, F8 patch, F9 restore, F10 dt -2%%, F11 dt +2%%, F3 filter(30fps section), F4 filter(60fps section)");
