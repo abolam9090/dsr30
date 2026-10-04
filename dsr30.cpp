@@ -215,7 +215,7 @@ static void Apply(bool toThirty) {
 // ---- patch only specific exe offsets (from dsr30.ini "Patch=") ----
 static std::vector<size_t> gOffsets;
 
-static float gDtScale = 1.38f;     // tuned by feel at 30 FPS
+static float gDtScale = 1.44f;     // tuned by feel at 30 FPS
 static UINT32 gCurBits = F60;      // value we last wrote
 
 static void ApplyList(bool toThirty) {
@@ -279,7 +279,7 @@ static DWORD WINAPI Init(LPVOID) {
         Log("IAT GetTickCount64: %d", HookIAT("GetTickCount64", (void*)hGTC64, (void**)&oGTC64));
         Log("IAT timeGetTime: %d", HookIAT("timeGetTime", (void*)hTGT, (void**)&oTGT));
     }
-    GetPrivateProfileStringA("dsr30", "DtScale", "1.38", b, 64, ini); gDtScale = (float)atof(b);
+    GetPrivateProfileStringA("dsr30", "DtScale", "1.44", b, 64, ini); gDtScale = (float)atof(b);
     char lst[2048];
     GetPrivateProfileStringA("dsr30", "Patch", "12CCC78", lst, 2048, ini);
     for (char* t = strtok(lst, ", "); t; t = strtok(nullptr, ", ")) gOffsets.push_back((size_t)strtoull(t, nullptr, 16));
