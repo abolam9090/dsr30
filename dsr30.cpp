@@ -216,18 +216,20 @@ static void Apply(bool toThirty) {
 // ---- patch only specific exe offsets (from dsr30.ini "Patch=") ----
 static std::vector<size_t> gOffsets;
 
-static float gDtScale = 1.44f;     // tuned by feel at 30 FPS
-static UINT32 gCurBits = F60;      // value we last wrote
+static float gDtScale = 1.44f;     // speed spot(s) in Patch=
+static float gDtScale2 = 2.0f;     // camera spot(s) in Patch2=
+static std::vector<size_t> gOffsets2;
+static UINT32 gCurBits = F60, gCurBits2 = F60;   // values we last wrote
 
-static void ApplyList(bool toThirty) {
+static UINT32 BitsFor(float scale) { float f = scale / 60.0f; UINT32 b; memcpy(&b, &f, 4); return b; }
+
+static int PatchList(const std::vector<size_t>& list, UINT32 want, UINT32& lastWritten) {
     BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
-    float fv = gDtScale / 60.0f; UINT32 want; memcpy(&want, &fv, 4);
-    if (!toThirty) want = F60;
     int n = 0;
-    for (size_t off : gOffsets) {
+    for (size_t off : list) {
         BYTE* a = exe + off;
         UINT32 cur; memcpy(&cur, a, 4);
-        if (cur != F60 && cur != gCurBits && cur != want) { Log("  skip exe+0x%llX (value changed)", (unsigned long long)off); continue; }
+        if (cur != F60 && cur != lastWritten && cur != want) { Log("  skip exe+0x%llX (value changed)", (unsigned long long)off); continue; }
         DWORD old;
         if (!VirtualProtect(a, 4, PAGE_EXECUTE_READWRITE, &old)) continue;
         memcpy(a, &want, 4);
@@ -235,8 +237,18 @@ static void ApplyList(bool toThirty) {
         FlushInstructionCache(GetCurrentProcess(), a, 4);
         n++;
     }
-    gCurBits = want; gPatched = toThirty;
-    Log("%s dtScale=%.3f (%.6f s) at %d locations", toThirty ? "PATCHED" : "RESTORED", toThirty ? gDtScale : 1.0f, toThirty ? fv : 1.0f/60.0f, n);
+    lastWritten = want;
+    return n;
+}
+
+static void ApplyList(bool toThirty) {
+    UINT32 w1 = toThirty ? BitsFor(gDtScale) : F60;
+    UINT32 w2 = toThirty ? BitsFor(gDtScale2) : F60;
+    int n1 = PatchList(gOffsets, w1, gCurBits);
+    int n2 = PatchList(gOffsets2, w2, gCurBits2);
+    gPatched = toThirty;
+    Log("%s speed dtScale=%.3f at %d spots, camera dtScale=%.3f at %d spots",
+        toThirty ? "PATCHED" : "RESTORED", toThirty ? gDtScale : 1.0f, n1, toThirty ? gDtScale2 : 1.0f, n2);
 }
 
 static void DoPatch(bool toThirty) {
@@ -285,7 +297,11 @@ static DWORD WINAPI Init(LPVOID) {
     char lst[2048];
     GetPrivateProfileStringA("dsr30", "Patch", "12CCC78", lst, 2048, ini);
     for (char* t = strtok(lst, ", "); t; t = strtok(nullptr, ", ")) gOffsets.push_back((size_t)strtoull(t, nullptr, 16));
-    Log("Patch list has %u offsets", (unsigned)gOffsets.size());
+    GetPrivateProfileStringA("dsr30", "DtScale2", "2.0", b, 64, ini); gDtScale2 = (float)atof(b);
+    char lst2[2048];
+    GetPrivateProfileStringA("dsr30", "Patch2", "1342C10,1342C14,1342C18,1342C1C", lst2, 2048, ini);
+    for (char* t = strtok(lst2, ", "); t; t = strtok(nullptr, ", ")) gOffsets2.push_back((size_t)strtoull(t, nullptr, 16));
+    Log("Speed spots: %u (scale %.3f), camera spots: %u (scale %.3f)", (unsigned)gOffsets.size(), gDtScale, (unsigned)gOffsets2.size(), gDtScale2);
     int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 15, ini);
     if (autoSec > 0) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
     CreateThread(0, 0, HotkeyThread, 0, 0, 0);
