@@ -91,6 +91,7 @@ static DWORD WINAPI hTGT() {
 typedef HRESULT(STDMETHODCALLTYPE* Present_t)(IDXGISwapChain*, UINT, UINT);
 static Present_t oPresent;
 static LONGLONG nextFrame = 0;
+static int gSyncInterval = 0;   // >0: let the display hold each frame for N vblanks (perfect pacing)
 
 static HRESULT STDMETHODCALLTYPE hPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
     static int n = 0; if (++n == 1) Log("Present hook is running");
@@ -99,7 +100,9 @@ static HRESULT STDMETHODCALLTYPE hPresent(IDXGISwapChain* sc, UINT sync, UINT fl
       if (!t0) t0 = q.QuadPart; frames++;
       double el = (double)(q.QuadPart - t0) / qf.QuadPart;
       if (el >= 10.0) { Log("measured FPS: %.2f", frames / el); t0 = q.QuadPart; frames = 0; } }
-    HRESULT hr = oPresent(sc, sync, flags);
+    HRESULT hr = gSyncInterval > 0 ? oPresent(sc, (UINT)gSyncInterval, flags & ~0x200u)
+                                   : oPresent(sc, sync, flags);
+    if (gSyncInterval > 0) return hr;   // vblank pacing replaces the software limiter
     LARGE_INTEGER f, now;
     QueryPerformanceFrequency(&f);
     LONGLONG step = (LONGLONG)(f.QuadPart / TARGET_FPS);
@@ -212,7 +215,7 @@ static void Apply(bool toThirty) {
 // ---- patch only specific exe offsets (from dsr30.ini "Patch=") ----
 static std::vector<size_t> gOffsets;
 
-static float gDtScale = 2.0f;      // 2.0 = exactly 1/30
+static float gDtScale = 1.38f;     // tuned by feel at 30 FPS
 static UINT32 gCurBits = F60;      // value we last wrote
 
 static void ApplyList(bool toThirty) {
@@ -276,15 +279,21 @@ static DWORD WINAPI Init(LPVOID) {
         Log("IAT GetTickCount64: %d", HookIAT("GetTickCount64", (void*)hGTC64, (void**)&oGTC64));
         Log("IAT timeGetTime: %d", HookIAT("timeGetTime", (void*)hTGT, (void**)&oTGT));
     }
-    GetPrivateProfileStringA("dsr30", "DtScale", "2.0", b, 64, ini); gDtScale = (float)atof(b);
+    GetPrivateProfileStringA("dsr30", "DtScale", "1.38", b, 64, ini); gDtScale = (float)atof(b);
     char lst[2048];
-    GetPrivateProfileStringA("dsr30", "Patch", "", lst, 2048, ini);
+    GetPrivateProfileStringA("dsr30", "Patch", "12CCC78", lst, 2048, ini);
     for (char* t = strtok(lst, ", "); t; t = strtok(nullptr, ", ")) gOffsets.push_back((size_t)strtoull(t, nullptr, 16));
     Log("Patch list has %u offsets", (unsigned)gOffsets.size());
-    int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 0, ini);
+    int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 15, ini);
     if (autoSec > 0) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
     CreateThread(0, 0, HotkeyThread, 0, 0, 0);
     Log("Hotkeys: F6 scan exe, F7 scan all, F8 patch, F9 restore, F10 dt -2%%, F11 dt +2%%");
+    if (GetPrivateProfileIntA("dsr30", "Vsync30", 1, ini)) {
+        DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
+        int hz = EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) ? (int)dm.dmDisplayFrequency : 0;
+        if (hz >= 30 && hz % 30 == 0) gSyncInterval = hz / 30;
+        Log("Display %d Hz -> SyncInterval %d (0 = software limiter only)", hz, gSyncInterval);
+    }
     HookPresentVtable();
     Log("Present vtable hooked: %d", oPresent != nullptr);
     return 0;
