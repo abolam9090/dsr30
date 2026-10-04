@@ -168,6 +168,7 @@ static bool Readable(const MEMORY_BASIC_INFORMATION& m) {
 }
 
 static void Scan(bool wholeProcess) {
+    Log("Scan started (%s)...", wholeProcess ? "whole process" : "exe only");
     gCands.clear(); gPatched = false;
     BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
     auto nt = (IMAGE_NT_HEADERS*)(exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
@@ -185,13 +186,21 @@ static void Scan(bool wholeProcess) {
         if (!VirtualQuery(p, &m, sizeof(m))) break;
         BYTE* rb = (BYTE*)m.BaseAddress; SIZE_T rs = m.RegionSize;
         bool isSelf = rb < sb + ss && rb + rs > sb;
-        if (Readable(m) && !isSelf) {
+        if (Readable(m) && !isSelf && !(m.Protect & (PAGE_NOCACHE | PAGE_WRITECOMBINE)) && m.Type != MEM_MAPPED) {
             size_t step = wholeProcess ? 4 : 1;
-            for (SIZE_T i = 0; i + 8 <= rs; i += step) {
-                UINT32 f; memcpy(&f, rb + i, 4);
-                if (f == F60) { gCands.push_back({ rb + i, false }); continue; }
-                UINT64 d; memcpy(&d, rb + i, 8);
-                if (d == D60) gCands.push_back({ rb + i, true });
+            const SIZE_T CH = 1 << 20;
+            static std::vector<BYTE> buf(CH + 16);
+            for (SIZE_T off = 0; off < rs; off += CH) {
+                SIZE_T want = rs - off < CH + 8 ? rs - off : CH + 8, got = 0;
+                // ReadProcessMemory on ourselves fails safely instead of crashing the game
+                if (!ReadProcessMemory(GetCurrentProcess(), rb + off, buf.data(), want, &got) || got < 8) continue;
+                SIZE_T lim = (rs - off > CH) ? CH : got;
+                for (SIZE_T i = 0; i + 8 <= got && i < lim; i += step) {
+                    UINT32 f; memcpy(&f, &buf[i], 4);
+                    if (f == F60) { gCands.push_back({ rb + off + i, false }); continue; }
+                    UINT64 d; memcpy(&d, &buf[i], 8);
+                    if (d == D60) gCands.push_back({ rb + off + i, true });
+                }
             }
         }
         p = rb + rs;
@@ -228,6 +237,7 @@ static void Apply(bool toThirty) {
 static double gAltRatio = 2.0;   // value seen in the 30 fps mode = ScanValue * AltRatio
 
 static void Filter(bool wantAlt) {
+    Log("Filter started (%s)...", wantAlt ? "30fps-mode" : "60fps-mode");
     double td = wantAlt ? gScanValueD * gAltRatio : gScanValueD;
     float tf = (float)td; UINT32 tfb; memcpy(&tfb, &tf, 4); UINT64 tdb; memcpy(&tdb, &td, 8);
     BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
@@ -329,7 +339,7 @@ static DWORD WINAPI Init(LPVOID) {
     gCurBits = gCurBits2 = gScanF;
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
-    Log("---- loaded (generic build). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
+    Log("---- loaded (generic build v4 safe-scan). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
     timeBeginPeriod(1);   // precise Sleep() so the limiter does not overshoot frames
     Sleep(2000);
     if (TIME_SCALE != 1.0) {
