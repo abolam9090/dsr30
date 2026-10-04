@@ -4,9 +4,20 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 
-static const double TIME_SCALE = 2.0;
-static const double TARGET_FPS = 30.0;
+static double TIME_SCALE = 2.0;
+static double TARGET_FPS = 30.0;
+static char gDir[MAX_PATH];
+
+static void Log(const char* fmt, ...) {
+    char p[MAX_PATH]; lstrcpyA(p, gDir); lstrcatA(p, "dsr30.log");
+    FILE* f = fopen(p, "a"); if (!f) return;
+    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
+    fputc('\n', f); fclose(f);
+}
 
 // ---- dinput8 proxy ----
 typedef HRESULT(WINAPI* DI8Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
@@ -80,6 +91,7 @@ static Present_t oPresent;
 static LONGLONG nextFrame = 0;
 
 static HRESULT STDMETHODCALLTYPE hPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
+    static int n = 0; if (++n == 1) Log("Present hook is running");
     HRESULT hr = oPresent(sc, sync, flags);
     LARGE_INTEGER f, now;
     QueryPerformanceFrequency(&f);
@@ -121,11 +133,20 @@ static void HookPresentVtable() {
 }
 
 static DWORD WINAPI Init(LPVOID) {
+    GetModuleFileNameA(nullptr, gDir, MAX_PATH);
+    char* sl = strrchr(gDir, '\\'); if (sl) sl[1] = 0;
+    char ini[MAX_PATH]; lstrcpyA(ini, gDir); lstrcatA(ini, "dsr30.ini");
+    char b[64];
+    GetPrivateProfileStringA("dsr30", "TimeScale", "2.0", b, 64, ini); TIME_SCALE = atof(b);
+    GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
+    Log("---- loaded. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
     Sleep(2000);
-    HookIAT("QueryPerformanceCounter", (void*)hQPC, (void**)&oQPC);
-    HookIAT("GetTickCount64", (void*)hGTC64, (void**)&oGTC64);
-    HookIAT("timeGetTime", (void*)hTGT, (void**)&oTGT);
+    Log("IAT QueryPerformanceCounter: %d", HookIAT("QueryPerformanceCounter", (void*)hQPC, (void**)&oQPC));
+    Log("IAT GetTickCount64: %d", HookIAT("GetTickCount64", (void*)hGTC64, (void**)&oGTC64));
+    Log("IAT timeGetTime: %d", HookIAT("timeGetTime", (void*)hTGT, (void**)&oTGT));
+    Log("IAT GetTickCount: %d (not hooked, info only)", 0);
     HookPresentVtable();
+    Log("Present vtable hooked: %d", oPresent != nullptr);
     return 0;
 }
 
