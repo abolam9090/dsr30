@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <vector>
+#include <algorithm>
+#include <tlhelp32.h>
 #include <stdint.h>
 
 static double TIME_SCALE = 1.0;
@@ -315,32 +317,115 @@ static DWORD WINAPI AutoPatchThread(LPVOID p) {
 }
 
 
-// ---- re-write patched values continuously and report if the game keeps reverting them ----
+// ---- hardware write-watch: find WHICH code writes a value (logged, no game code is changed) ----
+struct Hit { BYTE* rip; BYTE b[48]; SIZE_T got; };
+static Hit gHits[16];
+static volatile LONG gNumHits = 0;
+static bool gArmed = false;
+
+static LONG CALLBACK Veh(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 0xF)) {
+        LONG idx = InterlockedIncrement(&gNumHits) - 1;
+        if (idx < 16) {
+            BYTE* rip = (BYTE*)ep->ContextRecord->Rip;
+            gHits[idx].rip = rip; gHits[idx].got = 0;
+            ReadProcessMemory(GetCurrentProcess(), rip - 32, gHits[idx].b, 48, &gHits[idx].got);
+        }
+        ep->ContextRecord->Dr6 = 0;
+        ep->ContextRecord->EFlags |= 0x10000;   // resume flag
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void ArmWatch(BYTE* addr) {
+    AddVectoredExceptionHandler(1, Veh);
+    std::vector<DWORD> ids;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te; te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te)) do {
+            if (te.th32OwnerProcessID == GetCurrentProcessId() && te.th32ThreadID != GetCurrentThreadId())
+                ids.push_back(te.th32ThreadID);
+        } while (Thread32Next(snap, &te));
+        CloseHandle(snap);
+    }
+    int ok = 0;
+    for (DWORD id : ids) {   // no allocation or file I/O while a thread is suspended
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, id);
+        if (!h) continue;
+        if (SuspendThread(h) != (DWORD)-1) {
+            CONTEXT ctx = {}; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(h, &ctx)) {
+                ctx.Dr0 = (DWORD64)addr; ctx.Dr6 = 0;
+                ctx.Dr7 = (ctx.Dr7 & ~(DWORD64)0xF0003) | 1ull | (1ull << 16) | (3ull << 18);  // write, 4 bytes
+                if (SetThreadContext(h, &ctx)) ok++;
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+    }
+    gArmed = true;
+    Log("WATCH armed on 0x%p for %d of %d threads (logging code that writes it)", addr, ok, (int)ids.size());
+}
+
+static void LogNewHits() {
+    static LONG logged = 0;
+    LONG n = gNumHits; if (n > 16) n = 16;
+    while (logged < n) {
+        Hit& h = gHits[logged];
+        HMODULE mod = nullptr; char name[MAX_PATH] = "?";
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)h.rip, &mod);
+        if (mod) { GetModuleFileNameA(mod, name, MAX_PATH); char* sl = strrchr(name, '\\'); if (sl) memmove(name, sl + 1, strlen(sl)); }
+        Log("WRITER hit #%d: %s+0x%llX (rip after the write)", (int)logged + 1, name, (unsigned long long)(h.rip - (BYTE*)mod));
+        char hex[256]; hex[0] = 0;
+        for (SIZE_T i = 0; i < h.got && i < 48; i++) sprintf(hex + i * 3, "%02X ", h.b[i]);
+        Log("  bytes (rip-32 .. rip+16): %s", hex);
+        logged++;
+    }
+}
+
+// ---- re-write patched values continuously, report which one the game keeps reverting ----
 static DWORD WINAPI FreezeThread(LPVOID) {
-    ULONGLONG last = GetTickCount64(); unsigned long long reverted = 0, checks = 0;
+    ULONGLONG last = GetTickCount64(); unsigned long long checks = 0;
+    std::vector<unsigned> cnt;
     for (;;) {
         Sleep(1);
-        if (!gFreezeOn) { last = GetTickCount64(); reverted = 0; checks = 0; continue; }
+        if (gArmed) LogNewHits();
+        if (!gFreezeOn) { last = GetTickCount64(); cnt.clear(); checks = 0; continue; }
         {
             Lock lk;
+            if (cnt.size() != gCands.size()) cnt.assign(gCands.size(), 0);
             double nd = gScanValueD * gDtScale; float nf = (float)nd;
             UINT32 nfb; memcpy(&nfb, &nf, 4); UINT64 ndb; memcpy(&ndb, &nd, 8);
-            for (auto& c : gCands) {
+            for (size_t i = 0; i < gCands.size(); i++) {
+                Cand& c = gCands[i];
                 UINT64 cur = 0; SIZE_T got = 0, need = c.isDouble ? 8 : 4;
                 if (!ReadProcessMemory(GetCurrentProcess(), c.addr, &cur, need, &got) || got != need) continue;
                 checks++;
                 bool same = c.isDouble ? (cur == ndb) : ((UINT32)cur == nfb);
                 if (!same) {
-                    reverted++;
+                    cnt[i]++;
                     SIZE_T wr = 0;
                     if (c.isDouble) WriteProcessMemory(GetCurrentProcess(), c.addr, &ndb, 8, &wr);
                     else WriteProcessMemory(GetCurrentProcess(), c.addr, &nfb, 4, &wr);
                 }
             }
-        }
-        if (GetTickCount64() - last > 5000) {
-            Log("freeze: %llu of %llu checks found the game had reverted the value (last 5s)", reverted, checks);
-            last = GetTickCount64(); reverted = 0; checks = 0;
+            if (GetTickCount64() - last > 5000) {
+                size_t best = 0; unsigned total = 0;
+                for (size_t i = 0; i < cnt.size(); i++) { total += cnt[i]; if (cnt[i] > cnt[best]) best = i; }
+                Log("freeze (last 5s): game reverted the value %u times in total", total);
+                for (size_t i = 0; i < cnt.size(); i++) if (cnt[i]) {
+                    BYTE* a = gCands[i].addr; BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+                    if (a >= exe && a < exe + 0x10000000) Log("  reverted %u times: exe+0x%llX", cnt[i], (unsigned long long)(a - exe));
+                    else Log("  reverted %u times: 0x%p", cnt[i], a);
+                }
+                if (!gArmed && !cnt.empty() && cnt[best] > 20) {
+                    gFreezeOn = false;          // stop writing so only the game's own writes are seen
+                    ArmWatch(gCands[best].addr);
+                }
+                last = GetTickCount64(); std::fill(cnt.begin(), cnt.end(), 0u); checks = 0;
+            }
         }
     }
 }
@@ -379,7 +464,7 @@ static DWORD WINAPI Init(LPVOID) {
     gCurBits = gCurBits2 = gScanF;
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
-    Log("---- loaded (generic build v5 freeze). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
+    Log("---- loaded (generic build v6 watch). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
     timeBeginPeriod(1);   // precise Sleep() so the limiter does not overshoot frames
     Sleep(2000);
     if (TIME_SCALE != 1.0) {
