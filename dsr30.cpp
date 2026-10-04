@@ -217,7 +217,7 @@ static void Apply(bool toThirty) {
 static std::vector<size_t> gOffsets;
 
 static float gDtScale = 1.44f;     // speed spot(s) in Patch=
-static float gDtScale2 = 2.0f;     // camera spot(s) in Patch2=
+static float gDtScale2 = 1.9f;     // camera spot(s) in Patch2=
 static std::vector<size_t> gOffsets2;
 static UINT32 gCurBits = F60, gCurBits2 = F60;   // values we last wrote
 
@@ -297,7 +297,7 @@ static DWORD WINAPI Init(LPVOID) {
     char lst[2048];
     GetPrivateProfileStringA("dsr30", "Patch", "12CCC78", lst, 2048, ini);
     for (char* t = strtok(lst, ", "); t; t = strtok(nullptr, ", ")) gOffsets.push_back((size_t)strtoull(t, nullptr, 16));
-    GetPrivateProfileStringA("dsr30", "DtScale2", "2.0", b, 64, ini); gDtScale2 = (float)atof(b);
+    GetPrivateProfileStringA("dsr30", "DtScale2", "1.9", b, 64, ini); gDtScale2 = (float)atof(b);
     char patch2str[2048];
     GetPrivateProfileStringA("dsr30", "Patch2", "1342C10,1342C14,1342C18,1342C1C", patch2str, 2048, ini);
     for (char* t = strtok(patch2str, ", "); t; t = strtok(nullptr, ", ")) gOffsets2.push_back((size_t)strtoull(t, nullptr, 16));
