@@ -523,6 +523,95 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
     }
 }
 
+
+// ---- early code patches / byte dumps (ini: SearchPatch=START:LEN:OLDHEX>NEWHEX ; Dump=OFFSET:LEN) ----
+static int HexVal(char c) { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; }
+static size_t ParseHex(const char* s, BYTE* out, size_t max) {
+    size_t n = 0;
+    while (s[0] && s[1] && n < max) { int a = HexVal(s[0]), b = HexVal(s[1]); if (a < 0 || b < 0) break; out[n++] = (BYTE)(a * 16 + b); s += 2; }
+    return n;
+}
+static void LogBytes(const char* tag, size_t off, const BYTE* p, size_t n) {
+    for (size_t i = 0; i < n; i += 16) {
+        char row[80]; row[0] = 0;
+        for (size_t j = 0; j < 16 && i + j < n; j++) sprintf(row + j * 3, "%02X ", p[i + j]);
+        Log("%s exe+0x%llX: %s", tag, (unsigned long long)(off + i), row);
+    }
+}
+static char gIni[MAX_PATH];
+struct SP { size_t start, len; std::vector<BYTE> ob, nb; bool done; };
+static std::vector<SP> gSP;
+
+static void SafeLogBytes(const char* tag, size_t off, size_t len) {
+    BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+    std::vector<BYTE> buf(len); SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), exe + off, buf.data(), len, &got) || got != len) { Log("%s exe+0x%llX unreadable", tag, (unsigned long long)off); return; }
+    LogBytes(tag, off, buf.data(), len);
+}
+
+// keeps looking (up to 60 s) until the pattern appears in the window, then patches it at once
+static DWORD WINAPI PatchPollThread(LPVOID) {
+    BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+    for (int iter = 0; iter < 6000; iter++) {
+        bool all = true;
+        for (auto& sp : gSP) {
+            if (sp.done) continue;
+            all = false;
+            std::vector<BYTE> buf(sp.len + sp.ob.size()); SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), exe + sp.start, buf.data(), buf.size(), &got) || got != buf.size()) continue;
+            for (size_t i = 0; i + sp.ob.size() <= buf.size(); i++) {
+                if (memcmp(&buf[i], sp.ob.data(), sp.ob.size()) != 0) continue;
+                size_t at = sp.start + i;
+                SafeLogBytes("SearchPatch BEFORE", at >= 16 ? at - 16 : 0, 48);
+                BYTE* a = exe + at; DWORD old;
+                VirtualProtect(a, sp.nb.size(), PAGE_EXECUTE_READWRITE, &old);
+                memcpy(a, sp.nb.data(), sp.nb.size());
+                VirtualProtect(a, sp.nb.size(), old, &old);
+                FlushInstructionCache(GetCurrentProcess(), a, sp.nb.size());
+                Log("SearchPatch: patched %u bytes at exe+0x%llX (after %d ms)", (unsigned)sp.nb.size(), (unsigned long long)at, iter * 10);
+                sp.done = true; break;
+            }
+        }
+        if (all) return 0;
+        Sleep(10);
+    }
+    for (auto& sp : gSP) if (!sp.done) Log("SearchPatch: pattern NOT found in exe+0x%llX .. +0x%llX", (unsigned long long)sp.start, (unsigned long long)(sp.start + sp.len));
+    return 0;
+}
+
+static void DoDumps(const char* ini) {
+    char buf[2048];
+    GetPrivateProfileStringA("dsr30", "Dump", "", buf, 2048, ini);
+    for (char* t = strtok(buf, ", "); t; t = strtok(nullptr, ", ")) {
+        char* c = strchr(t, ':'); if (!c) continue;
+        size_t off = (size_t)strtoull(t, nullptr, 16), len = (size_t)strtoull(c + 1, nullptr, 16);
+        if (len > 512) len = 512;
+        SafeLogBytes("DUMP", off, len);
+    }
+}
+static DWORD WINAPI DumpLaterThread(LPVOID) { Sleep(8000); Log("---- dump again after 8 s (code may be unpacked by now)"); DoDumps(gIni); return 0; }
+
+static void EarlyPatches(const char* ini) {
+    lstrcpyA(gIni, ini);
+    char buf[2048];
+    GetPrivateProfileStringA("dsr30", "SearchPatch", "", buf, 2048, ini);
+    for (char* t = strtok(buf, ", "); t; t = strtok(nullptr, ", ")) {
+        char* c1 = strchr(t, ':'); if (!c1) continue;
+        char* c2 = strchr(c1 + 1, ':'); if (!c2) continue;
+        char* gt = strchr(c2 + 1, '>'); if (!gt) continue;
+        SP sp; sp.done = false;
+        sp.start = (size_t)strtoull(t, nullptr, 16); sp.len = (size_t)strtoull(c1 + 1, nullptr, 16);
+        BYTE ob[64], nb[64]; size_t no = ParseHex(c2 + 1, ob, 64), nn = ParseHex(gt + 1, nb, 64);
+        if (!no || no != nn) { Log("SearchPatch: bad pattern"); continue; }
+        sp.ob.assign(ob, ob + no); sp.nb.assign(nb, nb + nn);
+        gSP.push_back(sp);
+    }
+    Log("SearchPatch entries: %u", (unsigned)gSP.size());
+    if (!gSP.empty()) CreateThread(0, 0, PatchPollThread, 0, 0, 0);
+    DoDumps(ini);
+    CreateThread(0, 0, DumpLaterThread, 0, 0, 0);
+}
+
 static DWORD WINAPI Init(LPVOID) {
     InitializeCriticalSection(&gCS);
     GetModuleFileNameA(nullptr, gDir, MAX_PATH);
@@ -537,7 +626,8 @@ static DWORD WINAPI Init(LPVOID) {
     gCurBits = gCurBits2 = gScanF;
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
-    Log("---- loaded (generic build v8 watch-exe). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
+    Log("---- loaded (generic build v10 patch+dump). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
+    EarlyPatches(ini);    // runs before the game finishes starting up
     timeBeginPeriod(1);   // precise Sleep() so the limiter does not overshoot frames
     Sleep(2000);
     if (TIME_SCALE != 1.0) {
