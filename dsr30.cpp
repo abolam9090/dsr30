@@ -356,7 +356,8 @@ static DWORD WINAPI AutoPatchThread(LPVOID p) {
 
 
 // ---- hardware write-watch: find WHICH code writes a value (logged, no game code is changed) ----
-struct Hit { BYTE* rip; BYTE b[48]; SIZE_T got; };
+struct Hit { BYTE* rip; BYTE b[48]; SIZE_T got; ULONG64 stk[8]; SIZE_T stkGot; ULONG64 rax, rcx, rdx; };
+static BYTE* gWatchAddr = nullptr;   // ini Watch=OFFSET (exe-relative)
 static Hit gHits[16];
 static volatile LONG gNumHits = 0;
 static bool gArmed = false;
@@ -368,6 +369,9 @@ static LONG CALLBACK Veh(PEXCEPTION_POINTERS ep) {
             BYTE* rip = (BYTE*)ep->ContextRecord->Rip;
             gHits[idx].rip = rip; gHits[idx].got = 0;
             ReadProcessMemory(GetCurrentProcess(), rip - 32, gHits[idx].b, 48, &gHits[idx].got);
+            gHits[idx].stkGot = 0;
+            ReadProcessMemory(GetCurrentProcess(), (LPCVOID)ep->ContextRecord->Rsp, gHits[idx].stk, 64, &gHits[idx].stkGot);
+            gHits[idx].rax = ep->ContextRecord->Rax; gHits[idx].rcx = ep->ContextRecord->Rcx; gHits[idx].rdx = ep->ContextRecord->Rdx;
         }
         ep->ContextRecord->Dr6 = 0;
         ep->ContextRecord->EFlags |= 0x10000;   // resume flag
@@ -376,7 +380,7 @@ static LONG CALLBACK Veh(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static void ArmWatch(BYTE* addr) {
+static void ArmWatch(BYTE* addr, bool quiet = false) {
     AddVectoredExceptionHandler(1, Veh);
     std::vector<DWORD> ids;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -404,7 +408,7 @@ static void ArmWatch(BYTE* addr) {
         CloseHandle(h);
     }
     gArmed = true;
-    Log("WATCH armed on 0x%p for %d of %d threads (logging code that writes it)", addr, ok, (int)ids.size());
+    if (!quiet) Log("WATCH armed on 0x%p for %d of %d threads (logging code that writes it)", addr, ok, (int)ids.size());
 }
 
 static void LogNewHits() {
@@ -419,6 +423,15 @@ static void LogNewHits() {
         char hex[256]; hex[0] = 0;
         for (SIZE_T i = 0; i < h.got && i < 48; i++) sprintf(hex + i * 3, "%02X ", h.b[i]);
         Log("  bytes (rip-32 .. rip+16): %s", hex);
+        {
+            BYTE* exe = (BYTE*)GetModuleHandleA(nullptr);
+            Log("  regs: rax=%llX rcx=%llX rdx=%llX", h.rax, h.rcx, h.rdx);
+            for (SIZE_T i = 0; i < h.stkGot / 8 && i < 8; i++) {
+                ULONG64 v = h.stk[i];
+                if (v >= (ULONG64)exe && v < (ULONG64)exe + 0x10000000) Log("  stack[%u]: exe+0x%llX", (unsigned)i, v - (ULONG64)exe);
+                else Log("  stack[%u]: %llX", (unsigned)i, v);
+            }
+        }
         logged++;
     }
 }
@@ -430,6 +443,7 @@ static DWORD WINAPI FreezeThread(LPVOID) {
     for (;;) {
         Sleep(1);
         if (gArmed) LogNewHits();
+        if (gWatchAddr) { static ULONGLONG lastRe = 0; ULONGLONG nw = GetTickCount64(); if (nw - lastRe > 3000) { lastRe = nw; ArmWatch(gWatchAddr, true); } }
         {   // keep pokes in place and report values
             static ULONGLONG lastPeek = 0; static unsigned pokeReverts = 0;
             if (gPokesOn && gFreezeEnabled) {
@@ -476,7 +490,7 @@ static DWORD WINAPI FreezeThread(LPVOID) {
                     if (a >= exe && a < exe + 0x10000000) Log("  reverted %u times: exe+0x%llX", cnt[i], (unsigned long long)(a - exe));
                     else Log("  reverted %u times: 0x%p", cnt[i], a);
                 }
-                if (!gArmed && !cnt.empty() && cnt[best] > 20) {
+                if (!gArmed && !gWatchAddr && !cnt.empty() && cnt[best] > 20) {
                     gFreezeOn = false;          // stop writing so only the game's own writes are seen
                     ArmWatch(gCands[best].addr);
                 }
@@ -487,7 +501,7 @@ static DWORD WINAPI FreezeThread(LPVOID) {
 }
 
 static DWORD WINAPI HotkeyThread(LPVOID) {
-    bool k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false, k3 = false, k4 = false;
+    bool k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false, k3 = false, k4 = false, k5 = false;
     for (;;) {
         Sleep(50);
         bool n6 = GetAsyncKeyState(VK_F6) & 0x8000, n7 = GetAsyncKeyState(VK_F7) & 0x8000;
@@ -502,6 +516,9 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         bool n3 = GetAsyncKeyState(VK_F3) & 0x8000, n4 = GetAsyncKeyState(VK_F4) & 0x8000;
         if (n3 && !k3) Filter(true);    // call while in the 30 fps section
         if (n4 && !k4) Filter(false);   // call while in the 60 fps section
+        bool n5 = GetAsyncKeyState(VK_F5) & 0x8000;
+        if (n5 && !k5) { Log("MARK (F5 pressed)"); for (auto& pk : gPeeks) LogValue(pk.first, pk.second, "peek:"); }
+        k5 = n5;
         k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11; k3 = n3; k4 = n4;
     }
 }
@@ -520,7 +537,7 @@ static DWORD WINAPI Init(LPVOID) {
     gCurBits = gCurBits2 = gScanF;
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
-    Log("---- loaded (generic build v7 poke). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
+    Log("---- loaded (generic build v8 watch-exe). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
     timeBeginPeriod(1);   // precise Sleep() so the limiter does not overshoot frames
     Sleep(2000);
     if (TIME_SCALE != 1.0) {
@@ -549,7 +566,9 @@ static DWORD WINAPI Init(LPVOID) {
           char* c = strchr(t, ':'); if (!c || !c[1]) continue;
           gPeeks.push_back({ (size_t)strtoull(t, nullptr, 16), c[1] });
       }
-      Log("Pokes: %u, peeks: %u", (unsigned)gPokes.size(), (unsigned)gPeeks.size()); }
+      Log("Pokes: %u, peeks: %u", (unsigned)gPokes.size(), (unsigned)gPeeks.size());
+      char wa[64]; GetPrivateProfileStringA("dsr30", "Watch", "", wa, 64, ini);
+      if (wa[0]) { gWatchAddr = (BYTE*)GetModuleHandleA(nullptr) + (size_t)strtoull(wa, nullptr, 16); ArmWatch(gWatchAddr); } }
     int autoSec = GetPrivateProfileIntA("dsr30", "AutoPatchSeconds", 15, ini);
     if (autoSec > 0 && (!gOffsets.empty() || !gOffsets2.empty() || !gPokes.empty())) CreateThread(0, 0, AutoPatchThread, (LPVOID)(INT_PTR)autoSec, 0, 0);
     CreateThread(0, 0, FreezeThread, 0, 0, 0);
