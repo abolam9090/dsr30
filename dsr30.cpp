@@ -103,10 +103,12 @@ static int gModeHigh = 60;
 static bool gSkipMode = false;
 static bool gSkipDraws = false;                 // also block draw calls on the frames that are not shown (saves GPU work)
 static volatile bool gSkipFrame = false;        // true while the frame being built will NOT be shown
-static volatile LONG gBlocked = 0, gAllowed = 0;
+static volatile LONG gBlocked = 0, gAllowed = 0, gOtherThread = 0;
+static volatile DWORD gPresentThread = 0;       // only draws from the thread that calls Present are blocked
 
 static HRESULT STDMETHODCALLTYPE hPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
     static int n = 0; if (++n == 1) Log("Present hook is running");
+    gPresentThread = GetCurrentThreadId();
     int mode = 0;
     if (gModeAddr) { int v = 0; SIZE_T got = 0; if (ReadProcessMemory(GetCurrentProcess(), gModeAddr, &v, 4, &got) && got == 4) mode = v; }
     bool skipThis = false; double target = TARGET_FPS;
@@ -122,8 +124,8 @@ static HRESULT STDMETHODCALLTYPE hPresent(IDXGISwapChain* sc, UINT sync, UINT fl
         if (!t0) t0 = q.QuadPart; frames++;
         double el = (double)(q.QuadPart - t0) / qf.QuadPart;
         if (el >= 10.0) {
-            Log("measured shown FPS: %.2f (mode=%d) draws blocked=%ld allowed=%ld", frames / el, mode, gBlocked, gAllowed);
-            gBlocked = 0; gAllowed = 0; t0 = q.QuadPart; frames = 0;
+            Log("measured shown FPS: %.2f (mode=%d) draws blocked=%ld allowed=%ld (other-thread draws seen on skipped frames: %ld)", frames / el, mode, gBlocked, gAllowed, gOtherThread);
+            gBlocked = 0; gAllowed = 0; gOtherThread = 0; t0 = q.QuadPart; frames = 0;
         }
         hr = gSyncInterval > 0 ? oPresent(sc, (UINT)gSyncInterval, flags & ~0x200u) : oPresent(sc, sync, flags);
     }
@@ -159,19 +161,19 @@ static DrawIndexed_t oDrawIndexed; static Draw_t oDraw; static DrawIndexedInstan
 static DrawInstanced_t oDrawInstanced; static DrawAuto_t oDrawAuto; static DrawIndirect_t oDrawIndexedInstancedIndirect, oDrawInstancedIndirect;
 
 static void STDMETHODCALLTYPE hDrawIndexed(ID3D11DeviceContext* c, UINT a, UINT b, INT d) {
-    if (gSkipFrame) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gAllowed); oDrawIndexed(c, a, b, d); }
+    if (gSkipFrame) { if (GetCurrentThreadId() == gPresentThread) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gOtherThread); } InterlockedIncrement(&gAllowed); oDrawIndexed(c, a, b, d); }
 static void STDMETHODCALLTYPE hDraw(ID3D11DeviceContext* c, UINT a, UINT b) {
-    if (gSkipFrame) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gAllowed); oDraw(c, a, b); }
+    if (gSkipFrame) { if (GetCurrentThreadId() == gPresentThread) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gOtherThread); } InterlockedIncrement(&gAllowed); oDraw(c, a, b); }
 static void STDMETHODCALLTYPE hDrawIndexedInstanced(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, INT e, UINT f) {
-    if (gSkipFrame) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gAllowed); oDrawIndexedInstanced(c, a, b, d, e, f); }
+    if (gSkipFrame) { if (GetCurrentThreadId() == gPresentThread) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gOtherThread); } InterlockedIncrement(&gAllowed); oDrawIndexedInstanced(c, a, b, d, e, f); }
 static void STDMETHODCALLTYPE hDrawInstanced(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, UINT e) {
-    if (gSkipFrame) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gAllowed); oDrawInstanced(c, a, b, d, e); }
+    if (gSkipFrame) { if (GetCurrentThreadId() == gPresentThread) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gOtherThread); } InterlockedIncrement(&gAllowed); oDrawInstanced(c, a, b, d, e); }
 static void STDMETHODCALLTYPE hDrawAuto(ID3D11DeviceContext* c) {
-    if (gSkipFrame) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gAllowed); oDrawAuto(c); }
+    if (gSkipFrame) { if (GetCurrentThreadId() == gPresentThread) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gOtherThread); } InterlockedIncrement(&gAllowed); oDrawAuto(c); }
 static void STDMETHODCALLTYPE hDrawIndexedInstancedIndirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
-    if (gSkipFrame) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gAllowed); oDrawIndexedInstancedIndirect(c, b, o); }
+    if (gSkipFrame) { if (GetCurrentThreadId() == gPresentThread) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gOtherThread); } InterlockedIncrement(&gAllowed); oDrawIndexedInstancedIndirect(c, b, o); }
 static void STDMETHODCALLTYPE hDrawInstancedIndirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
-    if (gSkipFrame) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gAllowed); oDrawInstancedIndirect(c, b, o); }
+    if (gSkipFrame) { if (GetCurrentThreadId() == gPresentThread) { InterlockedIncrement(&gBlocked); return; } InterlockedIncrement(&gOtherThread); } InterlockedIncrement(&gAllowed); oDrawInstancedIndirect(c, b, o); }
 
 static void PatchVT(void** vt, int idx, void* hook, void** orig) {
     DWORD old; VirtualProtect(&vt[idx], sizeof(void*), PAGE_READWRITE, &old);
@@ -695,7 +697,7 @@ static DWORD WINAPI Init(LPVOID) {
     gCurBits = gCurBits2 = gScanF;
     GetPrivateProfileStringA("dsr30", "TimeScale", "1.0", b, 64, ini); TIME_SCALE = atof(b);
     GetPrivateProfileStringA("dsr30", "TargetFPS", "30", b, 64, ini); TARGET_FPS = atof(b);
-    Log("---- loaded (generic build v12 skipdraws). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
+    Log("---- loaded (generic build v13 skipdraws-thread). ScanValue=%.9f", gScanValueD); Log("---- settings. TimeScale=%.3f TargetFPS=%.1f", TIME_SCALE, TARGET_FPS);
     EarlyPatches(ini);    // runs before the game finishes starting up
     timeBeginPeriod(1);   // precise Sleep() so the limiter does not overshoot frames
     Sleep(2000);
